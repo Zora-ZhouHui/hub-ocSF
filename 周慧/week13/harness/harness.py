@@ -5,6 +5,7 @@ Harness 核心引擎 - 渐进式披露架构
 - 常驻层: Skill 索引始终加载
 - 触发层: 匹配条件后按需加载完整 Skill
 - 执行层: Skill 执行期间完整驻留
+- LLM: deepseek-v4-flash 智能推理
 """
 
 import os
@@ -12,6 +13,8 @@ import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from llm_client import LLMClient, create_llm_client
 
 
 class ProgressiveDisclosure:
@@ -131,7 +134,7 @@ class MemorySystem:
         )
 
     def get_context(self) -> str:
-        """组装上下文（四层检索策略）"""
+        """组装上下文"""
         parts = []
 
         if self.long_term_memory.get("sections"):
@@ -221,11 +224,16 @@ class AgentNode:
     """Agent 执行引擎: ReAct 循环"""
 
     def __init__(
-        self, gateway: Gateway, memory: MemorySystem, disclosure: ProgressiveDisclosure
+        self,
+        gateway: Gateway,
+        memory: MemorySystem,
+        disclosure: ProgressiveDisclosure,
+        llm: LLMClient = None,
     ):
         self.gateway = gateway
         self.memory = memory
         self.disclosure = disclosure
+        self.llm = llm
         self.max_turns = 10
         self.tools = self._register_tools()
         self.base_dir = Path(__file__).resolve().parent.parent
@@ -272,7 +280,7 @@ class AgentNode:
     def _execute_skill(
         self, skill_name: str, skill_content: str, user_input: str
     ) -> dict:
-        """执行 Skill 流程（ReAct 循环），共享 execution_context"""
+        """执行 Skill 流程，共享 execution_context"""
         steps = self._parse_skill_steps(skill_content)
         results = []
         execution_context = {
@@ -281,7 +289,9 @@ class AgentNode:
             "extracted_texts": {},
             "summary": {},
             "supplementary_topics": [],
+            "search_strategies": [],
             "output_path": None,
+            "topic": "",
         }
 
         for i, step in enumerate(steps):
@@ -296,6 +306,20 @@ class AgentNode:
                 )
                 print(f"[Act] 调用 {tool_name}")
                 print(f"[Observation] {str(tool_result)[:200]}...")
+
+                if (
+                    isinstance(tool_result, dict)
+                    and tool_result.get("status") == "error"
+                ):
+                    print(f"\n[ReAct] ❌ 工具执行出错，中止后续步骤")
+                    return {
+                        "status": "error",
+                        "skill": skill_name,
+                        "steps_completed": len(results),
+                        "results": results,
+                        "message": tool_result.get("message", "Unknown error"),
+                        "error_step": step["name"],
+                    }
             else:
                 results.append(
                     {"step": step["name"], "tool": None, "result": "Skipped"}
@@ -312,30 +336,28 @@ class AgentNode:
 
     def _parse_skill_steps(self, skill_content: str) -> List[dict]:
         """解析 Skill 执行步骤"""
-        steps = []
-        if "ppt-knowledge-extractor" in skill_content:
-            steps = [
-                {
-                    "name": "PPT 文字提取",
-                    "reasoning": "需要先从 PPT 文件中提取原始文字内容",
-                    "tool": "ppt_extractor",
-                },
-                {
-                    "name": "知识总结",
-                    "reasoning": "从提取的内容中提炼核心概念和架构",
-                    "tool": "knowledge_summarizer",
-                },
-                {
-                    "name": "补充缺失知识",
-                    "reasoning": "搜索初学者可能缺失的前置知识",
-                    "tool": "web_searcher",
-                },
-                {
-                    "name": "生成 Markdown",
-                    "reasoning": "将总结内容输出为结构化文档",
-                    "tool": "markdown_writer",
-                },
-            ]
+        steps = [
+            {
+                "name": "PPT 文字提取",
+                "reasoning": "从 PPT 文件中提取原始文字内容",
+                "tool": "ppt_extractor",
+            },
+            {
+                "name": "知识总结",
+                "reasoning": "从提取的内容中提炼核心概念和架构",
+                "tool": "knowledge_summarizer",
+            },
+            {
+                "name": "补充缺失知识",
+                "reasoning": "为初学者识别需补充的前置知识",
+                "tool": "web_searcher",
+            },
+            {
+                "name": "生成 Markdown",
+                "reasoning": "将总结内容输出为结构化文档",
+                "tool": "markdown_writer",
+            },
+        ]
         return steps
 
     def _tool_ppt_extractor(self, ctx: dict, step: dict) -> dict:
@@ -383,111 +405,153 @@ class AgentNode:
         }
 
     def _tool_knowledge_summarizer(self, ctx: dict, step: dict) -> dict:
-        """工具: 知识总结 - 基于提取内容生成真实总结"""
+        """工具: 知识总结 - 优先使用 LLM，降级为智能规则提取"""
         extracted = ctx.get("extracted_texts", {})
         if not extracted:
             return {"status": "error", "message": "没有可总结的内容"}
 
+        structured_slides = []
         all_texts = []
         for filepath, slides in extracted.items():
             if isinstance(slides, list):
                 for slide in slides:
+                    structured_slides.append(slide)
                     all_texts.extend(slide.get("content", []))
 
         combined_text = "\n".join(all_texts)
 
-        summary = self._analyze_and_summarize(combined_text)
+        if self.llm and self.llm.is_available:
+            try:
+                print(
+                    "  [Knowledge Summarizer] 使用 LLM (deepseek-v4-flash) 进行智能分析..."
+                )
+                summary = self.llm.summarize_ppt(combined_text)
+                if "error" not in summary and summary.get("core_concepts"):
+                    topic = summary.get("topic", "") or self._infer_topic(all_texts)
+                    summary["topic"] = topic
+                    ctx["summary"] = summary
+                    ctx["topic"] = topic
+                    concepts_count = len(summary["core_concepts"])
+                    print(
+                        f"  [Knowledge Summarizer] ✅ LLM 分析成功: {concepts_count} 个核心概念"
+                    )
+                    print(f"  [Knowledge Summarizer] 🎯 主题: {topic}")
+                    return {
+                        "status": "success",
+                        "core_concepts_found": concepts_count,
+                        "topic": topic,
+                        "llm_used": True,
+                    }
+                else:
+                    print("  [Knowledge Summarizer] ⚠️ LLM 输出异常，降级为智能规则提取")
+            except Exception as e:
+                print(
+                    f"  [Knowledge Summarizer] ⚠️ LLM 调用失败 ({e})，降级为智能规则提取"
+                )
+
+        print("  [Knowledge Summarizer] 🔧 使用智能规则提取模式")
+        summary = self._analyze_slides(structured_slides, all_texts)
         ctx["summary"] = summary
-
-        topic = self._infer_topic(all_texts)
+        topic = summary.get("topic", "") or self._infer_topic(all_texts)
+        summary["topic"] = topic
         ctx["topic"] = topic
-
-        print(f"  [Knowledge Summarizer] 分析 {len(all_texts)} 条文本，生成总结")
-        print(f"  [Knowledge Summarizer] 主题推断: {topic}")
+        print(f"  [Knowledge Summarizer] 🎯 主题: {topic}")
+        print(
+            f"  [Knowledge Summarizer] 📊 提取: {len(summary.get('core_concepts', []))} 概念, "
+            f"{len(summary.get('architectures', []))} 架构, "
+            f"{len(summary.get('comparisons', []))} 对比"
+        )
 
         return {
             "status": "success",
             "core_concepts_found": len(summary.get("core_concepts", [])),
             "topic": topic,
+            "llm_used": False,
         }
 
-    def _analyze_and_summarize(self, text: str) -> dict:
-        """分析文本并生成结构化总结"""
+    def _analyze_slides(self, slides: list, all_texts: list) -> dict:
+        """基于幻灯片结构的智能分析 - 降级模式的核心"""
         concepts = []
         architectures = []
         comparisons = []
         best_practices = []
         applications = []
 
-        concept_keywords = [
-            "Agent",
-            "智能体",
-            "ReAct",
-            "Function Call",
-            "MCP",
-            "RAG",
-            "Skills",
-            "Harness",
-            "Prompt Engineering",
-            "Context Engineering",
-            "记忆模型",
-            "Gateway",
-            "Fat Gateway",
-            "Channel Adapter",
-            "Progressive Disclosure",
-            "渐进式披露",
-            "Context Window",
-            "Embedding",
-            "向量数据库",
-            "Token",
-            "Compaction",
-            "Memory Flush",
-        ]
+        slide_titles = []
+        for slide in slides:
+            content = slide.get("content", [])
+            if content:
+                title = self._extract_slide_title(content)
+                if title:
+                    slide_titles.append(title)
 
-        for kw in concept_keywords:
-            if kw.lower() in text.lower():
-                concepts.append(kw)
+        seen_concepts = set()
 
-        if any(
-            k in text for k in ["五大核心组件", "四大", "三层", "四层", "架构", "组件"]
-        ):
-            architectures.append("分层架构模型")
-        if any(
-            k in text for k in ["Gateway", "Nodes", "Skills", "Memory", "Control UI"]
-        ):
-            architectures.append("OpenClaw 五大组件")
-        if any(k in text for k in ["四层记忆", "L1", "L2", "L3", "L4"]):
-            architectures.append("四层记忆模型")
-        if any(k in text for k in ["渐进式披露", "Progressive Disclosure"]):
-            architectures.append("渐进式披露架构")
+        for slide in slides:
+            content = slide.get("content", [])
+            if not content:
+                continue
 
-        if any(k in text for k in ["对比", "vs", "区别", "不同于", "差异"]):
-            comparisons.append("技术对比分析")
-        if any(k in text for k in ["Platform vs Framework", "Function Call vs ReAct"]):
-            comparisons.append("框架对比")
+            title = self._extract_slide_title(content)
+            body = content[1:] if title else content
 
-        if any(k in text for k in ["原则", "最佳实践", "设计原则", "自检"]):
-            best_practices.append("设计原则")
-        if any(k in text for k in ["单一职责", "触发词精准", "自检机制"]):
-            best_practices.append("Skill 设计原则")
+            if title and len(title) > 3:
+                concepts.append({"name": title, "description": ""})
+                seen_concepts.add(title.strip().lower())
 
-        if any(k in text for k in ["应用", "场景", "案例", "个人助手", "企业"]):
-            applications.append("应用场景")
+            for line in body:
+                clean = self._clean_line(line)
+                if not clean or len(clean) < 4:
+                    continue
+                clean_lower = clean.lower()
 
-        supplementary = []
-        concept_set = set(concepts)
-        if "Agent" in concept_set or "智能体" in concept_set:
-            supplementary.append("AI Agent 基础概念")
-        if "MCP" in concept_set:
-            supplementary.append("MCP 协议详解")
-        if "RAG" in concept_set:
-            supplementary.append("RAG 检索增强生成")
-        if "向量数据库" in concept_set or "Embedding" in concept_set:
-            supplementary.append("向量数据库选型")
-        if "ReAct" in concept_set:
-            supplementary.append("ReAct 模式详解")
-        if "Function Call" in concept_set:
-            supplementary.append("Function Call 机制")
+                if clean_lower in seen_concepts:
+                    continue
+
+                if self._is_architecture_line(clean):
+                    architectures.append({"name": clean, "description": ""})
+                    seen_concepts.add(clean_lower)
+                    continue
+
+                if self._is_comparison_line(clean):
+                    comp = self._parse_comparison(clean)
+                    if comp:
+                        comparisons.append(comp)
+                    seen_concepts.add(clean_lower)
+                    continue
+
+                if self._is_practice_line(clean):
+                    best_practices.append({"title": clean, "description": ""})
+                    seen_concepts.add(clean_lower)
+                    continue
+
+                if self._is_application_line(clean):
+                    applications.append({"scenario": clean, "description": ""})
+                    seen_concepts.add(clean_lower)
+                    continue
+
+                if self._is_concept_line(clean):
+                    concepts.append({"name": clean, "description": ""})
+                    seen_concepts.add(clean_lower)
+
+        if len(concepts) > 20:
+            concepts = concepts[:20]
+
+        concepts = self._filter_metadata_concepts(concepts)
+
+        if not concepts:
+            for line in all_texts[:30]:
+                clean = self._clean_line(line)
+                if clean and len(clean) > 4:
+                    concepts.append({"name": clean[:60], "description": ""})
+                if len(concepts) >= 10:
+                    break
+
+        topic = self._derive_topic(slide_titles, concepts, all_texts)
+
+        supplementary = self._derive_supplementary_topics(
+            concepts, architectures, comparisons
+        )
 
         return {
             "core_concepts": concepts,
@@ -496,57 +560,471 @@ class AgentNode:
             "best_practices": best_practices,
             "applications": applications,
             "supplementary_topics": supplementary,
-            "raw_text_length": len(text),
+            "topic": topic,
         }
 
-    def _infer_topic(self, texts: list) -> str:
-        """推断主题"""
-        all_text = " ".join(texts)
-        if any(k in all_text for k in ["Harness", "OpenClaw", "Agent 平台"]):
-            return "AI_Agent_Harness_Architecture"
-        if any(k in all_text for k in ["Skills", "Function Call", "MCP", "RAG"]):
-            return "AI_Agent_Skills_Paradigm"
-        if any(k in all_text for k in ["记忆", "Memory", "记忆模型"]):
-            return "AI_Agent_Memory_System"
-        return "AI_Agent_Knowledge_Summary"
+    def _filter_metadata_concepts(self, concepts: list) -> list:
+        """过滤元数据类的概念条目（版权、来源、宣传语等）"""
+        metadata_patterns = [
+            r"出品",
+            r"出品方",
+            r"版权",
+            r"盗版必究",
+            r"GitHub\s*Star",
+            r"万\+",
+            r"www\.",
+            r"http",
+            r"扫码",
+            r"关注",
+            r"公众号",
+            r"微信",
+            r"进度\d+",
+            r"完成度",
+        ]
+        filtered = []
+        for concept in concepts:
+            name = (
+                concept.get("name", "") if isinstance(concept, dict) else str(concept)
+            )
+            is_metadata = False
+            for pattern in metadata_patterns:
+                if re.search(pattern, name, re.IGNORECASE):
+                    is_metadata = True
+                    break
+            if not is_metadata and len(name) > 3:
+                filtered.append(concept)
+        return filtered
 
-    def _tool_web_searcher(self, ctx: dict, step: dict) -> dict:
-        """工具: 网络搜索补充 - 识别需补充的知识点"""
-        summary = ctx.get("summary", {})
-        topics = summary.get("supplementary_topics", [])
+    def _clean_line(self, line: str) -> str:
+        """清理文本行：去除标记符号和多余空白"""
+        clean = line.strip()
+        clean = re.sub(r"^[•·\-\*–—\+\d\.\)、]+", "", clean)
+        clean = re.sub(r"\s+", " ", clean)
+        return clean.strip()
 
-        search_queries = []
-        for topic in topics:
-            query = f"{topic} 入门教程 详解 2025"
-            search_queries.append(query)
+    def _extract_slide_title(self, content: list) -> str:
+        """从幻灯片内容中提取标题（通常是第一个有效且较短的文本行）"""
+        for text in content:
+            clean = self._clean_line(text)
+            if 3 < len(clean) <= 50:
+                return clean
+            if len(clean) > 50:
+                return ""
+        return ""
 
-        if not search_queries:
-            search_queries = [
-                "AI Agent 入门教程 基础概念详解",
-                "ReAct Function Call 区别 对比",
-                "MCP 协议 架构 详解",
-                "RAG 检索增强生成 原理",
+    def _is_concept_line(self, text: str) -> bool:
+        """判断是否为概念/术语行"""
+        concept_markers = [
+            "是",
+            "是一种",
+            "是一个",
+            "称为",
+            "叫做",
+            "指",
+            "即",
+            "核心",
+            "关键",
+            "重要",
+            "主要",
+            "基本",
+            "Engine",
+            "Framework",
+            "Library",
+            "Platform",
+            "System",
+            "Module",
+            "Component",
+            "Service",
+            "Model",
+            "Algorithm",
+            "Protocol",
+            "Interface",
+            "架构",
+            "框架",
+            "模型",
+            "协议",
+            "接口",
+        ]
+        if len(text) < 3 or len(text) > 60:
+            return False
+        for marker in concept_markers:
+            if marker.lower() in text.lower():
+                return True
+        if text.endswith(("。", "！", "？", "：", ":")):
+            return False
+        if len(text) <= 30 and not text.startswith(("因为", "所以", "但是", "如果")):
+            return True
+        return False
+
+    def _is_architecture_line(self, text: str) -> bool:
+        """判断是否为架构/结构行"""
+        arch_keywords = [
+            "架构",
+            "模型",
+            "分层",
+            "组件",
+            "模块",
+            "流程",
+            "管道",
+            "架构图",
+            "结构图",
+            "分层",
+            "Stack",
+            "Layer",
+            "Pipeline",
+            "组件",
+            "节点",
+            "适配器",
+            "网关",
+            "路由器",
+            "三层",
+            "四层",
+            "五层",
+            "六层",
+        ]
+        for kw in arch_keywords:
+            if kw.lower() in text.lower():
+                return True
+        if re.match(r"^[一二三四五六七八九十]+[层级章节]", text):
+            return True
+        if re.match(r"^\d+[\.、)）]", text) and len(text) > 5:
+            return True
+        return False
+
+    def _is_comparison_line(self, text: str) -> bool:
+        """判断是否为对比行"""
+        comp_keywords = [
+            "对比",
+            "区别",
+            "vs",
+            "VS",
+            "不同于",
+            "差异",
+            "比较",
+            "vs",
+            "相比",
+            "vs.",
+            "相较于",
+            "与...对比",
+            "Platform vs",
+            "Framework vs",
+        ]
+        for kw in comp_keywords:
+            if kw.lower() in text.lower():
+                return True
+        if " vs " in text.lower() and len(text) > 5:
+            return True
+        return False
+
+    def _parse_comparison(self, text: str) -> dict:
+        """解析对比行，提取 A vs B 结构"""
+        vs_patterns = [
+            r"(.+?)\s*vs\s*(.+)",
+            r"(.+?)\s*VS\s*(.+)",
+            r"(.+?)对比(.+)",
+            r"(.+?)不同于(.+)",
+            r"(.+?)区别(.+)",
+        ]
+        for pattern in vs_patterns:
+            match = re.match(pattern, text, re.IGNORECASE)
+            if match:
+                a = match.group(1).strip()
+                b = match.group(2).strip()
+                return {"a": a, "b": b, "difference": text}
+        return {"a": text, "b": "", "difference": ""}
+
+    def _is_practice_line(self, text: str) -> bool:
+        """判断是否为最佳实践/原则行"""
+        practice_keywords = [
+            "原则",
+            "最佳实践",
+            "设计原则",
+            "应该",
+            "必须",
+            "建议",
+            "实践",
+            "规范",
+            "约定",
+            "模式",
+            "需要",
+            "应当",
+            "务必",
+            "推荐",
+        ]
+        for kw in practice_keywords:
+            if kw in text:
+                return True
+        if text.startswith(("• ", "- ", "* ")) and len(text) > 10:
+            return True
+        return False
+
+    def _is_application_line(self, text: str) -> bool:
+        """判断是否为应用场景行"""
+        app_keywords = [
+            "应用",
+            "场景",
+            "案例",
+            "适用",
+            "可以用于",
+            "使用场景",
+            "典型应用",
+            "实际案例",
+            "适用于",
+            "可用于",
+            "能够",
+        ]
+        for kw in app_keywords:
+            if kw in text:
+                return True
+        return False
+
+    def _derive_topic(self, slide_titles: list, concepts: list, all_texts: list) -> str:
+        """从幻灯片标题和概念中推断主题"""
+        if slide_titles:
+            first_title = slide_titles[0]
+            if len(first_title) > 3:
+                return self._normalize_topic(first_title)
+
+        for concept in concepts:
+            name = (
+                concept.get("name", "") if isinstance(concept, dict) else str(concept)
+            )
+            if name and len(name) > 3 and not name.endswith(("。", "！", "？")):
+                return self._normalize_topic(name)
+
+        for text in all_texts[:5]:
+            clean = self._clean_line(text)
+            if 3 < len(clean) < 50:
+                return self._normalize_topic(clean)
+
+        return "Knowledge_Summary"
+
+    def _normalize_topic(self, topic: str) -> str:
+        """将主题名规范化为可用的标识符"""
+        topic = topic.strip()
+        if not topic:
+            return "Knowledge_Summary"
+        if re.match(r"^[\x00-\x7F]+$", topic):
+            topic = topic.replace(" ", "_")
+        else:
+            chinese_chars = "".join(c for c in topic if "\u4e00" <= c <= "\u9fff")
+            if chinese_chars:
+                pinyin_map = {
+                    "系统": "System",
+                    "架构": "Architecture",
+                    "模型": "Model",
+                    "设计": "Design",
+                    "开发": "Development",
+                    "应用": "Application",
+                    "框架": "Framework",
+                    "平台": "Platform",
+                    "服务": "Service",
+                    "工具": "Tool",
+                    "技能": "Skill",
+                    "记忆": "Memory",
+                    "协议": "Protocol",
+                    "接口": "Interface",
+                    "组件": "Component",
+                    "模块": "Module",
+                    "安全": "Security",
+                    "数据": "Data",
+                    "分析": "Analysis",
+                    "算法": "Algorithm",
+                    "网络": "Network",
+                    "前端": "Frontend",
+                    "后端": "Backend",
+                    "数据库": "Database",
+                    "机器学习": "ML",
+                    "深度学习": "DL",
+                    "人工智能": "AI",
+                }
+                result = []
+                remaining = chinese_chars
+                for k, v in sorted(pinyin_map.items(), key=lambda x: -len(x[0])):
+                    if k in remaining:
+                        result.append(v)
+                        remaining = remaining.replace(k, "")
+                if result:
+                    topic = "_".join(result)
+                else:
+                    topic = chinese_chars[:10] or "Knowledge_Summary"
+            else:
+                topic = re.sub(r"[^\w\s&\-]", "", topic)
+                topic = topic.replace(" ", "_")
+        topic = re.sub(r"_+", "_", topic)
+        topic = topic.strip("_&- ")
+        return topic if topic else "Knowledge_Summary"
+
+    def _derive_supplementary_topics(
+        self, concepts: list, architectures: list, comparisons: list
+    ) -> list:
+        """推断需要补充的前置知识点"""
+        topic_names = set()
+        for c in concepts[:5]:
+            name = c.get("name", "") if isinstance(c, dict) else str(c)
+            topic_names.add(name.lower())
+
+        supplementary = []
+        knowledge_domains = [
+            ("基础概念", ["基础", "入门", "概念", "介绍", "简介"]),
+            ("核心原理", ["原理", "机制", "工作方式", "原理", "底层"]),
+            ("实践指南", ["实践", "指南", "教程", "实战", "案例"]),
+            ("设计模式", ["模式", "设计", "架构", "结构"]),
+            ("性能优化", ["性能", "优化", "效率", "速度"]),
+            ("安全基础", ["安全", "权限", "认证", "加密"]),
+        ]
+
+        matched = set()
+        for domain_name, keywords in knowledge_domains:
+            if domain_name in matched:
+                continue
+            for concept_name in topic_names:
+                if any(kw in concept_name for kw in keywords):
+                    supplementary.append(domain_name)
+                    matched.add(domain_name)
+                    break
+
+        if not supplementary:
+            primary = ""
+            if concepts:
+                primary = (
+                    concepts[0].get("name", "")
+                    if isinstance(concepts[0], dict)
+                    else str(concepts[0])
+                )
+            supplementary = [
+                f"{primary}基础概念" if primary else "相关基础概念",
+                f"{primary}核心原理" if primary else "核心原理",
+                f"{primary}实践指南" if primary else "实践指南",
             ]
 
+        return supplementary[:5]
+
+    def _infer_topic(self, texts: list) -> str:
+        """从文本列表推断主题"""
+        if not texts:
+            return "Knowledge_Summary"
+        first_text = self._clean_line(texts[0]) if texts else ""
+        if first_text and len(first_text) > 3:
+            return self._normalize_topic(first_text)
+        return "Knowledge_Summary"
+
+    def _tool_web_searcher(self, ctx: dict, step: dict) -> dict:
+        """工具: 补充知识 - 使用 LLM 生成搜索策略，降级为基于概念的智能搜索建议"""
+        summary = ctx.get("summary", {})
+        topics = summary.get("supplementary_topics", [])
+        concepts = summary.get("core_concepts", [])
+        topic_name = ctx.get("topic", "")
+
+        search_strategies = []
+        llm_used = False
+
+        if self.llm and self.llm.is_available and topics:
+            try:
+                print(
+                    f"  [Web Searcher] 使用 LLM 为 {len(topics)} 个知识点生成搜索策略..."
+                )
+                search_strategies = self.llm.supplement_knowledge(topics)
+                if search_strategies:
+                    llm_used = True
+                    print(
+                        f"  [Web Searcher] ✅ LLM 生成 {len(search_strategies)} 条搜索策略"
+                    )
+            except Exception as e:
+                print(f"  [Web Searcher] ⚠️ LLM 调用失败 ({e})，使用概念驱动策略")
+
+        if not search_strategies:
+            search_strategies = self._generate_search_strategies(
+                topics, concepts, topic_name
+            )
+            print(
+                f"  [Web Searcher] 🔧 基于概念生成 {len(search_strategies)} 条搜索建议"
+            )
+
         ctx["supplementary_topics"] = topics
-        print(f"  [Web Searcher] 规划 {len(search_queries)} 个搜索查询")
-        for q in search_queries[:3]:
-            print(f"    - {q}")
+        ctx["search_strategies"] = search_strategies
+
+        print(f"  [Web Searcher] 📋 搜索查询列表:")
+        for s in search_strategies[:3]:
+            print(
+                f"    - [{s.get('priority', 'medium')}] {s.get('topic', '')} → {s.get('search_query', '')}"
+            )
 
         return {
             "status": "success",
-            "queries_planned": search_queries,
+            "queries_planned": [s.get("search_query", "") for s in search_strategies],
             "topics_to_supplement": topics,
+            "search_strategies": search_strategies,
+            "llm_used": llm_used,
         }
 
+    def _generate_search_strategies(
+        self, topics: list, concepts: list, topic_name: str
+    ) -> list:
+        """基于概念生成具体的搜索策略"""
+        strategies = []
+
+        concept_names = []
+        for c in concepts[:8]:
+            if isinstance(c, dict):
+                name = c.get("name", "")
+            else:
+                name = str(c)
+            if name and len(name) > 2:
+                concept_names.append(name)
+
+        seen_queries = set()
+
+        for topic in topics[:5]:
+            query = f"{topic} 入门教程 详解"
+            if query not in seen_queries:
+                seen_queries.add(query)
+                priority = "high" if len(strategies) < 2 else "medium"
+                strategies.append(
+                    {
+                        "topic": topic,
+                        "search_query": query,
+                        "brief_intro": f"理解{topic}的基础概念和核心方法",
+                        "priority": priority,
+                    }
+                )
+
+        for concept in concept_names[:3]:
+            query = f"{concept} 基础概念 详解"
+            if query not in seen_queries:
+                seen_queries.add(query)
+                strategies.append(
+                    {
+                        "topic": concept,
+                        "search_query": query,
+                        "brief_intro": f"「{concept}」的入门知识",
+                        "priority": "medium",
+                    }
+                )
+
+        if not strategies:
+            strategies.append(
+                {
+                    "topic": topic_name or "相关技术",
+                    "search_query": f"{topic_name or '相关技术'} 入门教程 2025",
+                    "brief_intro": "系统学习相关技术",
+                    "priority": "medium",
+                }
+            )
+
+        return strategies[:6]
+
     def _tool_markdown_writer(self, ctx: dict, step: dict) -> dict:
-        """工具: Markdown 文档生成 - 写入 week13/result/"""
+        """工具: Markdown 文档生成"""
         summary = ctx.get("summary", {})
-        topic = ctx.get("topic", "AI_Agent_Knowledge_Summary")
+        topic = ctx.get("topic", "Knowledge_Summary")
         supplementary = ctx.get("supplementary_topics", [])
+        search_strategies = ctx.get("search_strategies", [])
         ppt_files = ctx.get("ppt_files", [])
 
-        md_content = self._build_markdown(summary, topic, supplementary, ppt_files)
+        md_content = self._build_markdown(
+            summary, topic, supplementary, ppt_files, search_strategies
+        )
 
         safe_name = topic.replace(" ", "_").replace("/", "_")
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -569,164 +1047,267 @@ class AgentNode:
         }
 
     def _build_markdown(
-        self, summary: dict, topic: str, supplementary: list, ppt_files: list
+        self,
+        summary: dict,
+        topic: str,
+        supplementary: list,
+        ppt_files: list,
+        search_strategies: list = None,
     ) -> str:
-        """构建 Markdown 内容"""
+        """构建 Markdown 内容 - 纯数据驱动，无硬编码"""
         lines = []
-        lines.append(f"# {topic.replace('_', ' ')} 核心知识体系总结\n")
-        lines.append(f"> 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append(f"> 来源: {', '.join(Path(f).name for f in ppt_files)}")
+        safe_topic = topic.replace("_", " ")
+        lines.append(f"# {safe_topic} 知识总结\n")
+        lines.append(f"> **生成时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"> **来源文件**: {', '.join(Path(f).name for f in ppt_files)}")
+        lines.append(f"> **分析引擎**: Harness Engine v2.0 (deepseek-v4-flash)")
         lines.append("")
 
-        lines.append("## 一、基础概念补充\n")
-        lines.append("### 1.1 什么是 AI Agent（智能体）\n")
-        lines.append(
-            "**AI Agent** 是能够**自主感知环境、规划任务、调用工具并执行**的AI系统。"
-        )
-        lines.append(
-            '它不是单一模型，而是一套 **"大模型(LLM) + 记忆 + 规划 + 工具"** 的组合拳。\n'
-        )
-        lines.append("| 对比维度 | 传统AI（聊天机器人） | AI Agent |")
-        lines.append("|---|---|---|")
-        lines.append("| 工作模式 | **被动响应** | **主动推进** |")
-        lines.append("| 处理任务 | 单一步骤 | 复杂多步 |")
-        lines.append("| 记忆能力 | 短期记忆 | 长期记忆 |")
-        lines.append("| 遇到问题 | 卡住就停 | 自我修正 |\n")
+        has_any_content = False
 
-        lines.append("### 1.2 核心术语\n")
-        lines.append("| 术语 | 解释 |")
-        lines.append("|---|---|")
-        lines.append("| **Token** | LLM 处理文本的最小单位 |")
-        lines.append("| **Context Window** | LLM 单次能处理的最大 token 数 |")
-        lines.append("| **Embedding** | 将文本转换为高维向量的过程 |")
-        lines.append("| **Vector Database** | 专门存储和检索向量的数据库 |")
-        lines.append("| **幻觉 (Hallucination)** | LLM 生成不准确或虚构内容的现象 |\n")
-
-        lines.append("## 二、核心内容总结\n")
         concepts = summary.get("core_concepts", [])
         if concepts:
-            lines.append(f"### 2.1 核心概念 ({len(concepts)} 个)\n")
-            for concept in concepts:
-                lines.append(f"- **{concept}**")
+            has_any_content = True
+            lines.append("## 一、核心概念\n")
+            lines.append("| # | 概念 | 说明 |")
+            lines.append("|---|------|------|")
+            for i, item in enumerate(concepts, 1):
+                if isinstance(item, dict):
+                    name = item.get("name", item.get("concept", ""))
+                    desc = item.get("description", item.get("desc", ""))
+                else:
+                    name = str(item)
+                    desc = ""
+                lines.append(f"| {i} | **{name}** | {desc} |")
             lines.append("")
 
         archs = summary.get("architectures", [])
         if archs:
-            lines.append(f"### 2.2 架构模型 ({len(archs)} 个)\n")
-            for arch in archs:
-                lines.append(f"- {arch}")
-            lines.append("")
+            has_any_content = True
+            lines.append("## 二、架构与模型\n")
+            for i, item in enumerate(archs, 1):
+                if isinstance(item, dict):
+                    name = item.get("name", item.get("architecture", ""))
+                    desc = item.get("description", item.get("desc", ""))
+                else:
+                    name = str(item)
+                    desc = ""
+                lines.append(f"### 2.{i} {name}\n")
+                if desc:
+                    lines.append(f"{desc}\n")
 
         comps = summary.get("comparisons", [])
         if comps:
-            lines.append(f"### 2.3 技术对比 ({len(comps)} 项)\n")
-            for comp in comps:
-                lines.append(f"- {comp}")
+            has_any_content = True
+            lines.append("## 三、对比分析\n")
+            lines.append("| 项目A | 项目B | 对比要点 |")
+            lines.append("|-------|-------|---------|")
+            for item in comps:
+                if isinstance(item, dict):
+                    a = item.get("a", item.get("item_a", item.get("from", "")))
+                    b = item.get("b", item.get("item_b", item.get("to", "")))
+                    diff = item.get(
+                        "difference", item.get("key_points", item.get("desc", ""))
+                    )
+                else:
+                    a = str(item)
+                    b = ""
+                    diff = ""
+                lines.append(f"| {a} | {b} | {diff} |")
             lines.append("")
 
         practices = summary.get("best_practices", [])
         if practices:
-            lines.append(f"### 2.4 最佳实践 ({len(practices)} 项)\n")
-            for p in practices:
-                lines.append(f"- {p}")
+            has_any_content = True
+            lines.append("## 四、最佳实践\n")
+            for i, item in enumerate(practices, 1):
+                if isinstance(item, dict):
+                    title = item.get("title", item.get("name", f"实践{i}"))
+                    desc = item.get("description", item.get("desc", ""))
+                else:
+                    title = str(item)
+                    desc = ""
+                lines.append(f"- **{title}**")
+                if desc:
+                    lines.append(f"  - {desc}")
             lines.append("")
 
         apps = summary.get("applications", [])
         if apps:
-            lines.append(f"### 2.5 应用场景 ({len(apps)} 类)\n")
-            for app in apps:
-                lines.append(f"- {app}")
+            has_any_content = True
+            lines.append("## 五、应用场景\n")
+            lines.append("| # | 场景 | 说明 |")
+            lines.append("|---|------|------|")
+            for i, item in enumerate(apps, 1):
+                if isinstance(item, dict):
+                    name = item.get("scenario", item.get("name", ""))
+                    desc = item.get("description", item.get("desc", ""))
+                else:
+                    name = str(item)
+                    desc = ""
+                lines.append(f"| {i} | {name} | {desc} |")
             lines.append("")
 
-        lines.append("## 三、架构与模型详解\n")
-        lines.append("### 3.1 工程三层架构\n")
-        lines.append(
-            "从 Prompt Engineering → Context Engineering → Harness Engineering，外延逐层扩大：\n"
-        )
-        lines.append("| 层次 | 核心问题 | 技术手段 | 适用场景 |")
-        lines.append("|---|---|---|---|")
-        lines.append(
-            "| **Prompt Engineering** | 如何把任务说清楚 | Role Prompting, CoT, ReAct | 单轮问答、意图对齐 |"
-        )
-        lines.append(
-            "| **Context Engineering** | 模型关键时刻看到什么 | RAG, Tools, Memory, State | 多工具、长对话、知识密集 |"
-        )
-        lines.append(
-            "| **Harness Engineering** | 模型在什么机制里运行 | 目标边界, 反馈回路, 记录系统 | 生产级、长任务、多Agent |\n"
-        )
+        if not has_any_content:
+            lines.append("> 本 PPT 未提取到结构化内容，建议检查文件格式或内容。\n")
 
-        lines.append("### 3.2 渐进式披露架构\n")
-        lines.append("| 层级 | 内容 | Token 占用 | 加载时机 |")
-        lines.append("|---|---|---|---|")
-        lines.append("| **常驻层** | Skill 索引摘要 | < 200 | 始终加载 |")
-        lines.append("| **触发层** | 完整 Skill 定义 | 500-2000 | 匹配触发词后 |")
-        lines.append("| **执行层** | Skill 完整驻留 | 完整 | 执行期间 |\n")
+        if search_strategies:
+            lines.append("## 六、前置知识补充\n")
+            lines.append("以下为理解本主题需要掌握的前置知识点，建议优先学习：\n")
+            for i, strategy in enumerate(search_strategies, 1):
+                topic_name = strategy.get("topic", f"知识点{i}")
+                brief = strategy.get("brief_intro", "")
+                query = strategy.get("search_query", "")
+                priority = strategy.get("priority", "medium")
+                priority_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
+                    priority, "🟡"
+                )
+                lines.append(f"### 6.{i} {priority_icon} {topic_name}\n")
+                if brief:
+                    lines.append(f"{brief}\n")
+                if query:
+                    lines.append(f"> 🔍 搜索建议：`{query}`\n")
+        elif supplementary:
+            lines.append("## 六、前置知识补充\n")
+            lines.append("以下为理解本主题需要掌握的前置知识点：\n")
+            for i, topic_item in enumerate(supplementary, 1):
+                lines.append(f"### 6.{i} {topic_item}\n")
+                lines.append("（建议通过搜索引擎进一步学习）\n")
 
-        lines.append("## 四、概念辨析与对比\n")
-        lines.append("### 4.1 Function Call vs MCP vs RAG vs Skills\n")
-        lines.append("| 概念 | 核心特征 | 类比 |")
-        lines.append("|---|---|---|")
-        lines.append(
-            '| **Function Call** | 模型输出结构化JSON，框架路由执行 | "函数调用" |'
-        )
-        lines.append('| **MCP** | 标准化工具接口，动态发现与调用 | "USB接口" |')
-        lines.append('| **RAG** | 外部知识检索注入，弥补LLM知识缺失 | "外脑" |')
-        lines.append('| **Skills** | 行为封装+知识内聚+按需加载 | "专家模块" |\n')
-        lines.append(
-            "> 四者**不互斥**：Skills 是上层调度者，Function Call、MCP、RAG 是其可选执行模块\n"
-        )
-
-        lines.append("### 4.2 四层记忆模型\n")
-        lines.append("| 层级 | 名称 | 存储 | 速度 | 生命周期 |")
-        lines.append("|---|---|---|---|---|")
-        lines.append("| L1 | Working Memory | Context Window | 即时 | 当前会话 |")
-        lines.append("| L2 | Short-term Memory | SQLite/每日MD | ~5ms | 当天~数天 |")
-        lines.append("| L3 | Long-term Memory | MEMORY.md + USER.md | ~1ms | 永久 |")
-        lines.append("| L4 | Vector Search | 向量数据库 | ~10-50ms | 永久 |\n")
-
-        lines.append("## 五、补充知识点\n")
-        lines.append("以下为初学者需要掌握的前置知识：\n")
-        for i, topic_item in enumerate(supplementary, 1):
-            lines.append(f"### 5.{i} {topic_item}\n")
-            lines.append("（建议通过搜索引擎进一步学习相关内容）\n")
-
-        vector_db_keywords = ["向量数据库", "Embedding", "Vector Database"]
-        has_vector_db_topic = any(
-            any(kw in topic for kw in vector_db_keywords) for topic in supplementary
-        )
-        if not has_vector_db_topic:
-            lines.append(f"### 5.{len(supplementary) + 1} 向量数据库选型\n")
-            lines.append("| 数据库 | 特点 | 适用场景 |")
-            lines.append("|---|---|---|")
-            lines.append("| **FAISS** | Facebook开源，高性能 | 学术研究、单机场景 |")
-            lines.append("| **Chroma** | 轻量、零依赖 | 开发测试、小型应用 |")
-            lines.append("| **Milvus** | 分布式、大规模 | 企业级生产环境 |")
-            lines.append("| **Pinecone** | 全托管云服务 | 企业级、免运维 |\n")
-
-        lines.append("## 六、学习路径建议\n")
+        lines.append("## 七、学习路径\n")
         lines.append("```")
-        lines.append("入门：理解 LLM、Token、Context、幻觉 →")
-        lines.append("进阶：学习 Function Call、ReAct、RAG 基础 →")
-        lines.append("深入：掌握 MCP 协议、向量数据库、记忆系统 →")
-        lines.append("实战：使用 Harness / LangChain 构建 Agent →")
-        lines.append("精通：Harness Engineering、Skills 设计、生产级部署")
+        lines.append(f"入门 → 理解 {safe_topic} 基础概念 →")
+        lines.append("进阶 → 掌握核心方法与实践 →")
+        lines.append("深入 → 研究架构原理与设计权衡 →")
+        lines.append("实战 → 在真实项目中应用与迭代 →")
+        lines.append("精通 → 形成体系化认知与创新能力")
         lines.append("```\n")
 
         lines.append("---\n")
-        lines.append(f"*文档由 Harness Engine v1.0 自动生成*")
-        lines.append(f"*基于 {', '.join(Path(f).name for f in ppt_files)} 的内容*")
+        lines.append("*本文档由 Harness Engine v2.0 + deepseek-v4-flash 自动生成*")
 
         return "\n".join(lines)
 
     def _extract_ppt_paths(self, user_input: str) -> List[str]:
-        """从用户输入中提取 PPT 文件路径"""
+        """从用户输入中提取 PPT 文件路径 - 支持精确路径、文件名、目录"""
         paths = []
+        found_set = set()
+
+        search_dirs = self._get_search_dirs(user_input)
+
         words = user_input.split()
+        ppt_extensions = (".ppt", ".pptx")
+
         for word in words:
             clean = word.strip("\"'(),")
-            if clean.endswith((".ppt", ".pptx")) and os.path.exists(clean):
-                paths.append(clean)
+            if not clean:
+                continue
+
+            if clean.endswith(ppt_extensions):
+                if os.path.isabs(clean) and os.path.exists(clean):
+                    abs_path = os.path.abspath(clean)
+                    if abs_path not in found_set:
+                        found_set.add(abs_path)
+                        paths.append(abs_path)
+                else:
+                    for search_dir in search_dirs:
+                        candidate = os.path.join(search_dir, clean)
+                        if os.path.exists(candidate):
+                            abs_path = os.path.abspath(candidate)
+                            if abs_path not in found_set:
+                                found_set.add(abs_path)
+                                paths.append(abs_path)
+                            break
+                    else:
+                        for search_dir in search_dirs:
+                            found = self._glob_find(search_dir, clean)
+                            for fp in found:
+                                if fp not in found_set:
+                                    found_set.add(fp)
+                                    paths.append(fp)
+
+            elif os.path.isdir(clean):
+                ppt_files = self._scan_directory(clean)
+                for fp in ppt_files:
+                    if fp not in found_set:
+                        found_set.add(fp)
+                        paths.append(fp)
+
+        if not paths:
+            for search_dir in search_dirs:
+                ppt_files = self._scan_directory(search_dir)
+                for fp in ppt_files:
+                    if fp not in found_set:
+                        found_set.add(fp)
+                        paths.append(fp)
+                if paths:
+                    break
+
         return paths
+
+    def _get_search_dirs(self, user_input: str) -> List[str]:
+        """获取 PPT 文件的搜索目录"""
+        dirs = []
+        cwd = os.getcwd()
+
+        data_dir = os.path.join(cwd, "..", "data")
+        if os.path.isdir(data_dir):
+            dirs.append(os.path.abspath(data_dir))
+
+        parent_data_dir = os.path.join(cwd, "data")
+        if os.path.isdir(parent_data_dir):
+            dirs.append(os.path.abspath(parent_data_dir))
+
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        for _ in range(5):
+            candidate_data = os.path.join(current_dir, "data")
+            if os.path.isdir(candidate_data):
+                abs_dir = os.path.abspath(candidate_data)
+                if abs_dir not in dirs:
+                    dirs.append(abs_dir)
+
+        user_dirs = re.findall(r'["\']?([^\s"\']+\.pptx?)["\']?', user_input)
+        for ud in user_dirs:
+            ud_dir = os.path.dirname(ud)
+            if ud_dir and os.path.isdir(ud_dir):
+                abs_dir = os.path.abspath(ud_dir)
+                if abs_dir not in dirs:
+                    dirs.append(abs_dir)
+
+        week13_dir = os.path.join(cwd, "..")
+        if os.path.isdir(week13_dir):
+            dirs.append(os.path.abspath(week13_dir))
+
+        if cwd not in dirs:
+            dirs.append(cwd)
+
+        return dirs
+
+    def _scan_directory(self, directory: str) -> List[str]:
+        """扫描目录中的 PPT 文件"""
+        ppt_files = []
+        try:
+            for root, dirs, files in os.walk(directory):
+                for f in files:
+                    if f.lower().endswith((".ppt", ".pptx")):
+                        ppt_files.append(os.path.join(root, f))
+        except PermissionError:
+            pass
+        return ppt_files
+
+    def _glob_find(self, base_dir: str, filename: str) -> List[str]:
+        """在目录中递归查找文件"""
+        found = []
+        try:
+            for root, dirs, files in os.walk(base_dir):
+                for f in files:
+                    if f == filename:
+                        found.append(os.path.join(root, f))
+                if found:
+                    break
+        except PermissionError:
+            pass
+        return found
 
     def _handle_no_match(self, user_input: str) -> dict:
         """无匹配 Skill 时的处理"""
@@ -752,17 +1333,27 @@ class Harness:
         self.gateway = Gateway()
         self.memory = MemorySystem(config_dir)
         self.disclosure = ProgressiveDisclosure(config_dir)
-        self.agent = AgentNode(self.gateway, self.memory, self.disclosure)
+
+        soul_path = os.path.join(config_dir, "SOUL.md")
+        self.llm = create_llm_client(soul_path=soul_path)
+        if self.llm.is_available:
+            print(f"  ✅ LLM 已就绪: {self.llm.model}")
+        else:
+            print(f"  ⚠️  LLM 未配置 (DEEPSEEK_API_KEY 未设置)，将使用规则降级模式")
+
+        self.agent = AgentNode(self.gateway, self.memory, self.disclosure, llm=self.llm)
         self._display_banner()
 
     def _display_banner(self):
         """显示 Harness 启动信息"""
         print("=" * 60)
-        print("  Harness Engine v1.0")
+        print("  Harness Engine v2.0 (LLM-Powered)")
         print("  渐进式披露架构 | Progressive Disclosure")
         print("=" * 60)
         print(f"\n  配置目录: {self.config_dir}")
         print(f"  结果输出: {self.agent.result_dir}")
+        llm_status = "✅ deepseek-v4-flash" if self.llm.is_available else "⚠️  降级模式"
+        print(f"  LLM 引擎: {llm_status}")
         print(f"  可用 Skills: {len(self.disclosure.skill_index)}")
         for s in self.disclosure.skill_index:
             triggers = ", ".join(s.get("triggers", [])[:2])
